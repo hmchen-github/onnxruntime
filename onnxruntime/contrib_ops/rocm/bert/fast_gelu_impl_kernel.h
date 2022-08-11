@@ -5,8 +5,6 @@
 
 #include "contrib_ops/rocm/bert/util.h"
 
-using namespace onnxruntime::rocm;
-
 namespace onnxruntime {
 namespace contrib {
 namespace rocm {
@@ -65,7 +63,7 @@ __global__ void FastGeluKernelVec(int input_length, int bias_length, const T* in
       const T cdf = a + a * (twoT/(oneT + emu) - oneT);
       output_v[i] = x * cdf;
     }
-    *(reinterpret_cast<VecT*>(&output[idx])) = *reinterpret_cast<VecT*>(&output_v[0]);
+    *(reinterpret_cast<VecT*>(&output[idx])) = *output_val;
   }
 }
 
