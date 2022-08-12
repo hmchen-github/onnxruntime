@@ -5,11 +5,11 @@
 
 #include <hip/hip_runtime.h>
 #include "python/tools/kernel_explorer/device_array.h"
-#include "python/tools/kernel_explorer/operator.h"
+#include "python/tools/kernel_explorer/kernel_explorer_interface.h"
 #include "contrib_ops/rocm/bert/util.h"
 
-using onnxruntime::contrib::rocm::CeilingDivision;
 using onnxruntime::contrib::rocm::AlignedVector;
+using onnxruntime::contrib::rocm::CeilingDivision;
 
 namespace onnxruntime {
 
@@ -48,13 +48,15 @@ __global__ void VectorAddKernel(const T* __restrict__ x,
 }
 
 template <typename T, int ThreadsPerBlock, int VecSize>
-void LaunchVectorAdd(hipStream_t stream, const T* x, const T* y, T* z, int n) {
+Status LaunchVectorAdd(hipStream_t stream, const T* x, const T* y, T* z, int n) {
   hipLaunchKernelGGL((VectorAddKernel<T, VecSize>),
-                     dim3(CeilingDivision(n, ThreadsPerBlock*VecSize)),
+                     dim3(CeilingDivision(n, ThreadsPerBlock * VecSize)),
                      dim3(ThreadsPerBlock),
                      0, stream,
                      x, y, z, n);
-  HIP_CALL_THROW(hipGetLastError());
+  // TODO: use ORT status wrapper
+  auto status = hipGetLastError();
+  return status == hipSuccess ? Status::OK() : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, hipGetErrorName(status));
 }
 
 }  // namespace onnxruntime

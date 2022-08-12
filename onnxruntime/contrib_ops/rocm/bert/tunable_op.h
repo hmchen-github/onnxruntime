@@ -3,70 +3,79 @@
 
 #pragma once
 
+#include <functional>
 #include <map>
 #include <memory>
 #include <string>
+#include <numeric>
+#include <type_traits>
 #include <vector>
 #include <hip/hip_runtime.h>
+#include <hip/hip_fp16.h>
+#include "core/common/common.h"
 #include "contrib_ops/rocm/bert/util.h"
 
 namespace onnxruntime {
 namespace contrib {
 namespace rocm {
 
+template <typename T>
 struct OpParams {
-  explicit OpParams(hipStream_t stream) : stream(stream) {}
-  virtual std::string signature() const = 0;
-  hipStream_t stream;
+  std::string Signature() { return static_cast<T*>(this)->Signature(); }
+  hipStream_t stream{};
 };
 
-class Op {
- public:
-  Op() : repeats_(100) {}
-
-  virtual void Run(const OpParams*) = 0;
-
-  void SetRepeats(int n) {
-    repeats_ = n;
-  }
-
-  float Profile(const OpParams* op_params) {
-    // warm up
-    for (int i = 0; i < 5; i++) {
-      Run(op_params);
-    }
-    timer_.Start();
-    for (int i = 0; i < repeats_; i++) {
-      Run(op_params);
-    }
-    timer_.End();
-    return timer_.time()/repeats_;
-  }
-
-  virtual ~Op() {}
-
- private:
-  Timer timer_;
-  int repeats_;
+template <typename ParamsT>
+struct Op {
+  using type = std::function<Status(const std::remove_cv_t<ParamsT>*)>;
 };
 
+template <typename ParamsT>
+using OpT = typename Op<ParamsT>::type;
+
+template <typename ParamsT, int NumIter = 5>
+struct DefaultWarmUp {
+  void operator()(const OpT<ParamsT>& op, const ParamsT* param) {
+    ORT_ENFORCE(NumIter >= 0);
+    for (int i = 0; i < NumIter; i++) {
+      ORT_THROW_IF_ERROR(op(param));
+    }
+  };
+};
+
+template <typename ParamsT, int NumIter = 100>
+struct DefaultProfile {
+  double operator()(const OpT<ParamsT>& op, const ParamsT* param) {
+    ORT_ENFORCE(NumIter >= 0);
+    Timer timer{};
+    timer.Start();
+    for (int i = 0; i < NumIter; i++) {
+      ORT_THROW_IF_ERROR(op(param));
+    }
+    timer.End();
+    return timer.Duration() / NumIter;
+  };
+};
+
+template <typename ParamsT,
+          typename WarmUp = DefaultWarmUp<ParamsT>,
+          typename Profile = DefaultProfile<ParamsT>>
 class TunableOp {
  public:
-  explicit TunableOp(int default_id) : default_id_(default_id), tuning_(false) {}
-
-  void Run(const OpParams* op_params) {
+  Status operator()(const ParamsT* params) {
     int id;
-    if (tuning_ == true && Condition(op_params)) {
-      if (kernel_map_.find(op_params->signature()) == kernel_map_.end()) {
-        id = FindFastest(op_params);
-        kernel_map_.insert({op_params->signature(), id});
+    if (tuning_ == true && Condition(params)) {
+      if (kernel_map_.find(params->Signature()) == kernel_map_.end()) {
+        id = FindFastest(params);
+        kernel_map_.insert({params->Signature(), id});
       } else {
-        id = kernel_map_[op_params->signature()];
+        id = kernel_map_[params->Signature()];
       }
     } else {
       id = default_id_;
     }
-    ops_[id]->Run(op_params);
+    ORT_RETURN_IF_ERROR(ops_[id](params));
+    return Status::OK();
   }
 
   void EnableTuning() {
@@ -77,33 +86,63 @@ class TunableOp {
     tuning_ = false;
   }
 
-  virtual ~TunableOp() {}
+  virtual ~TunableOp() = default;
 
  protected:
-  std::vector<std::unique_ptr<Op>> ops_;
+  std::vector<OpT<ParamsT>> ops_;
 
  private:
-  virtual bool Condition(const OpParams* op_params) = 0;
+  // Whether we should tune for this input
+  virtual bool Condition(const ParamsT* /*params*/) {
+    return true;
+  }
 
-  int FindFastest(const OpParams* op_params) {
-    assert(ops_.size() > 0);
-    float min_time = ops_[0]->Profile(op_params);
-    int id = 0;
-    for (int i = 1; i < ops_.size(); i++) {
-      float time = ops_[i]->Profile(op_params);
+  int FindFastest(const ParamsT* params) {
+    auto min_time = std::numeric_limits<double>::max();
+    int id = -1;
+    for (size_t i = 0; i < this->ops_.size(); i++) {
+      WarmUp{}(ops_[i], params);
+      auto time = Profile{}(ops_[i], params);
       if (time < min_time) {
         min_time = time;
-        id = i;
+        id = static_cast<int>(i);
       }
     }
+    ORT_ENFORCE(id >= 0, "Cannot found viable op");
     return id;
   }
 
+  // mapping from Signature to best impl
   std::map<std::string, int> kernel_map_;
-  int default_id_;
-  bool tuning_;
+
+  // the default impl to use when tuning is disabled
+  int default_id_{0};
+
+  bool tuning_{false};
 };
 
 }  // namespace rocm
 }  // namespace contrib
+
+template <typename T>
+std::string TypeToString();
+
+template <>
+inline std::string TypeToString<half>() { return "f16"; };
+
+template <>
+inline std::string TypeToString<float>() { return "f32"; };
+
+template <>
+inline std::string TypeToString<double>() { return "f64"; };
+
+template <>
+inline std::string TypeToString<int8_t>() { return "i8"; };
+
+template <>
+inline std::string TypeToString<int32_t>() { return "i32"; };
+
+template <>
+inline std::string TypeToString<int64_t>() { return "i64"; };
+
 }  // namespace onnxruntime

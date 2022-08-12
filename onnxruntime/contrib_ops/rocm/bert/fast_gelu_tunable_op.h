@@ -14,74 +14,58 @@ namespace onnxruntime {
 namespace contrib {
 namespace rocm {
 
-template<typename T>
-struct FastGeluParams : OpParams {
-  FastGeluParams(hipStream_t stream, const T* input, const T* bias, T* output, int input_length, int bias_length) :
-    OpParams(stream), input(input), bias(bias), output(output), input_length(input_length), bias_length(bias_length) {}
-
-  std::string signature() const {
-    std::string sig = std::to_string(input_length) + "_" + std::to_string(bias_length);
+template <typename T>
+struct FastGeluParams : OpParams<FastGeluParams<T>> {
+  std::string Signature() const {
+    std::string sig = TypeToString<T>() + std::to_string(input_length) + "_" + std::to_string(bias_length);
     return sig;
   }
 
-  const T* input;
-  const T* bias;
-  T* output;
-  int input_length;
-  int bias_length;
+  const T* input{};
+  const T* bias{};
+  T* output{};
+  int input_length{};
+  int bias_length{};
 };
 
 template <typename T, int ThreadsPerBlock, int VecSize>
-void LaunchFastGelu(hipStream_t stream, const T* input, const T* bias, T* output, int input_length, int bias_length) {
+Status FastGeluOp(const FastGeluParams<T>* params) {
   hipLaunchKernelGGL((FastGeluKernelVec<T, ThreadsPerBlock, VecSize>),
-                  dim3(CeilingDivision(input_length, ThreadsPerBlock*VecSize)),
-                  dim3(ThreadsPerBlock),
-                  0, stream,
-                  input_length, bias_length, input, bias, output);
+                     dim3(CeilingDivision(params->input_length, ThreadsPerBlock * VecSize)),
+                     dim3(ThreadsPerBlock),
+                     0, params->stream,
+                     params->input_length, params->bias_length, params->input, params->bias, params->output);
+  // TODO: use ORT status wrapper
+  auto status = hipGetLastError();
+  return status == hipSuccess ? Status::OK() : ORT_MAKE_STATUS(ONNXRUNTIME, FAIL, hipGetErrorName(status));
 }
 
-
-template <typename T, int ThreadsPerBlock, int VecSize>
-class FastGeluOp : public Op {
+template <typename T>
+class FastGeluTunableOp : public TunableOp<FastGeluParams<T>> {
  public:
-  FastGeluOp() : Op() {}
+  FastGeluTunableOp() {
+#define ADD_SPECIALIZATIONS(threads_per_block)                  \
+  this->ops_.emplace_back(FastGeluOp<T, threads_per_block, 1>); \
+  this->ops_.emplace_back(FastGeluOp<T, threads_per_block, 2>); \
+  this->ops_.emplace_back(FastGeluOp<T, threads_per_block, 4>); \
+  this->ops_.emplace_back(FastGeluOp<T, threads_per_block, 8>); \
+  this->ops_.emplace_back(FastGeluOp<T, threads_per_block, 16>);
 
-  void Run(const OpParams* op_params) {
-    const FastGeluParams<T>* fast_gelu_params = static_cast<const FastGeluParams<T>*>(op_params);
-    LaunchFastGelu<T, ThreadsPerBlock, VecSize>(fast_gelu_params->stream,
-                                                fast_gelu_params->input,
-                                                fast_gelu_params->bias,
-                                                fast_gelu_params->output,
-                                                fast_gelu_params->input_length,
-                                                fast_gelu_params->bias_length);
-  }
-};
+    ADD_SPECIALIZATIONS(64);
+    ADD_SPECIALIZATIONS(128);
+    ADD_SPECIALIZATIONS(192);
+    ADD_SPECIALIZATIONS(256);
+    ADD_SPECIALIZATIONS(320);
+    ADD_SPECIALIZATIONS(384);
+    ADD_SPECIALIZATIONS(448);
+    ADD_SPECIALIZATIONS(512);
 
-#define ADD_OP(threads_per_block)                                           \
-  ops_.push_back(std::make_unique<FastGeluOp<T, threads_per_block, 1>>());  \
-  ops_.push_back(std::make_unique<FastGeluOp<T, threads_per_block, 2>>());  \
-  ops_.push_back(std::make_unique<FastGeluOp<T, threads_per_block, 4>>());  \
-  ops_.push_back(std::make_unique<FastGeluOp<T, threads_per_block, 8>>());  \
-  ops_.push_back(std::make_unique<FastGeluOp<T, threads_per_block, 16>>());
-
-template<typename T>
-class FastGeluTunableOp : public TunableOp {
- public:
-  FastGeluTunableOp() : TunableOp(15) {
-    ADD_OP(64);
-    ADD_OP(128);
-    ADD_OP(192);
-    ADD_OP(256);
-    ADD_OP(320);
-    ADD_OP(384);
-    ADD_OP(448);
-    ADD_OP(512);
+#undef ADD_SPECIALIZATIONS
   }
 
  private:
-  virtual bool Condition(const OpParams* op_params) {
-    const FastGeluParams<T>* fast_gelu_params = static_cast<const FastGeluParams<T>*>(op_params);
-    bool condition = (fast_gelu_params->bias_length > 0) && (fast_gelu_params->bias_length % 16 == 0);
+  bool Condition(const FastGeluParams<T>* params) override {
+    bool condition = (params->bias_length > 0) && (params->bias_length % 16 == 0);
     return condition;
   }
 };
