@@ -26,12 +26,16 @@ struct OpParams {
 };
 
 template <typename ParamsT>
-struct Op {
-  using type = std::function<Status(const std::remove_cv_t<ParamsT>*)>;
+class TunableFunction {
+  // using type = std::function<Status(const std::remove_cv_t<ParamsT>*)>;
+public:
+  template <typename T>
+
+
 };
 
 template <typename ParamsT>
-using OpT = typename Op<ParamsT>::type;
+using OpT = typename TunableFunction<ParamsT>::type;
 
 template <typename ParamsT, int NumIter = 5>
 struct DefaultWarmUp {
@@ -55,6 +59,23 @@ struct DefaultProfile {
     timer.End();
     return timer.Duration() / NumIter;
   };
+};
+
+// NOTE: onnxruntime's status currently do not have a StatusCode::UNSUPPORTED. Currently, we do not want to extend the
+// enum. So we reuse StatusCode::INVALID_ARGUMENT for this purpose. It can be interpreted as "The input argument is not
+// valid for this specialized kernel implementation.". This semantic is crucial for the tuning mechanism.
+#define TUNABLE_OP_MAKE_UNSUPPOTED_ARGUMENT_STATUS(...) ORT_MAKE_STATUS(NONE, INVALID_ARGUMENT, __VA_ARGS__)
+
+template <typename ParamsT>
+struct IsSupported {
+  bool operator()(const OpT<ParamsT>& op, const ParamsT* param) {
+    Status status = op(param);
+    if (status.Category() == common::StatusCategory::NONE && status.Code() == common::StatusCode::INVALID_ARGUMENT) {
+      return false;
+    }
+    ORT_THROW_IF_ERROR(status);
+    return true;
+  }
 };
 
 template <typename ParamsT,
@@ -101,6 +122,10 @@ class TunableOp {
     auto min_time = std::numeric_limits<double>::max();
     int id = -1;
     for (size_t i = 0; i < this->ops_.size(); i++) {
+      if (!IsSupported<ParamsT>{}(ops_[i], params)) {
+        continue;
+      }
+
       WarmUp{}(ops_[i], params);
       auto time = Profile{}(ops_[i], params);
       if (time < min_time) {
